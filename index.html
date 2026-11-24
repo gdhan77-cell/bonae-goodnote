@@ -488,6 +488,7 @@ input,textarea,select{font-family:inherit;color:inherit}
 .seg{display:flex;background:var(--ivory-2);border-radius:11px;padding:3px;gap:2px}
 .seg button{flex:1;height:32px;border-radius:9px;font-size:12px;color:var(--ink-soft)}
 .seg button.on{background:#fff;box-shadow:var(--shadow-s);font-weight:600;color:var(--accent)}
+#engineSeg button{height:auto;min-height:32px;padding:4px 2px;line-height:1.25;word-break:keep-all}
 .status-box{
   display:flex;gap:8px;align-items:flex-start;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.6;
   background:#F7F4EC;border:1px solid var(--line-2);color:var(--ink-soft);margin-bottom:14px;
@@ -753,10 +754,11 @@ input,textarea,select{font-family:inherit;color:inherit}
     <div class="field">
       <label>AI 분류 엔진</label>
       <div class="seg" id="engineSeg">
-        <button data-engine="local" class="on">내장 스마트 분류기</button>
+        <button data-engine="local" class="on">내장 분류기</button>
+        <button data-engine="free">무료 AI 자동 전환</button>
         <button data-engine="claude">Claude API</button>
       </div>
-      <p class="desc">내장 분류기는 API 키 없이 바로 동작해요. Claude 키를 넣으면 문맥을 읽어 더 정확하게 폴더·제목·날짜를 잡아 줍니다.</p>
+      <p class="desc">내장 분류기는 API 키 없이 바로 동작해요. 무료 AI를 고르면 Gemini·Groq·OpenRouter 무료 키를 순서대로 쓰고 한도·오류 때 다음 키로 넘어갑니다. Claude 키를 넣으면 문맥을 읽어 더 정확하게 폴더·제목·날짜를 잡아 줍니다.</p>
     </div>
 
     <div id="claudeBox" hidden>
@@ -767,12 +769,16 @@ input,textarea,select{font-family:inherit;color:inherit}
       </div>
       <div class="field">
         <label for="modelInput">모델</label>
-        <input class="input" id="modelInput" placeholder="claude-sonnet-4-5" autocomplete="off" spellcheck="false">
+        <input class="input" id="modelInput" placeholder="claude-sonnet-5-5" autocomplete="off" spellcheck="false">
       </div>
       <div class="row" style="margin-bottom:12px">
         <button class="btn primary" id="testKeyBtn">연결 테스트 &amp; 저장</button>
         <button class="btn" id="clearKeyBtn">키 삭제</button>
       </div>
+    </div>
+
+    <div id="freeBox" hidden>
+      <div id="freePool"></div>
     </div>
 
     <div class="status-box" id="engineStatus"><span id="engineStatusText">🔑 키 없음 · 내장 스마트 분류기로 동작 중</span></div>
@@ -880,6 +886,616 @@ input,textarea,select{font-family:inherit;color:inherit}
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <div id="printArea"></div>
 
+<!-- FREEAI-CORE:START -->
+<script>
+/* =========================================================================
+   한경동 님 무료 AI 자동 전환 엔진 (Free AI failover core) — v1.0
+   · 저장 위치: localStorage 'han_free_ai_pool_v1'  (free-ai-hub와 공유)
+   · 구조: { version, providers:[{id,type,label,apiKey,model,enabled,priority}],
+             claudeFallbackEnabled, claudeKey, claudeModel }
+   · Gemini · Groq · OpenRouter 무료 키를 순서대로 시도하고 429/오류면 즉시 다음 키로.
+   ========================================================================= */
+(function () {
+  'use strict';
+  if (window.HanFreeAI) return;
+
+  var POOL_KEY = 'han_free_ai_pool_v1';
+  var TYPES = {
+    gemini: { label: 'Google Gemini', short: 'Gemini', model: 'gemini-2.5-flash', hint: 'aistudio.google.com/apikey', ph: 'AIza…' },
+    groq: { label: 'Groq', short: 'Groq', model: 'llama-3.3-70b-versatile', hint: 'console.groq.com/keys', ph: 'gsk_…' },
+    openrouter: { label: 'OpenRouter', short: 'OpenRouter', model: 'meta-llama/llama-3.3-70b-instruct:free', hint: 'openrouter.ai/keys', ph: 'sk-or-…' }
+  };
+  var CLAUDE_MODELS = ['claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-sonnet-4-5'];
+
+  function err(code, message, extra) {
+    var e = new Error(message);
+    e.code = code;
+    if (extra) for (var k in extra) e[k] = extra[k];
+    return e;
+  }
+  function now() { return Date.now(); }
+  function uid() { return 'f' + now().toString(36) + Math.random().toString(36).slice(2, 7); }
+  function clean(s) { return String(s == null ? '' : s).trim(); }
+
+  function blank() {
+    return { version: 1, providers: [], claudeFallbackEnabled: true, claudeKey: '', claudeModel: CLAUDE_MODELS[0], updatedAt: '' };
+  }
+  function normProvider(p, i) {
+    if (!p || typeof p !== 'object') return null;
+    var type = String(p.type || '').toLowerCase();
+    if (!TYPES[type]) return null;
+    var label = clean(p.label) || (TYPES[type].short + ' ' + (i + 1));
+    var pr = Number(p.priority);
+    return {
+      id: clean(p.id) || uid(),
+      type: type,
+      label: label,
+      apiKey: clean(p.apiKey || p.key || ''),
+      model: clean(p.model) || TYPES[type].model,
+      enabled: p.enabled === false ? false : true,
+      priority: isFinite(pr) && pr > 0 ? pr : i + 1,
+      cooldownUntil: Number(p.cooldownUntil) || 0,
+      lastError: clean(p.lastError),
+      lastErrorAt: p.lastErrorAt || '',
+      lastOkAt: p.lastOkAt || ''
+    };
+  }
+  function load() {
+    var pool = blank();
+    var raw = null;
+    try { raw = localStorage.getItem(POOL_KEY); } catch (e) { raw = null; }
+    if (raw) {
+      try {
+        var j = JSON.parse(raw);
+        if (j && typeof j === 'object') {
+          pool = Object.assign(blank(), j);
+        }
+      } catch (e) { /* 깨진 값은 빈 풀로 */ }
+    }
+    var list = Array.isArray(pool.providers) ? pool.providers : [];
+    pool.providers = list.map(normProvider).filter(Boolean);
+    pool.claudeFallbackEnabled = pool.claudeFallbackEnabled !== false;
+    pool.claudeKey = clean(pool.claudeKey);
+    pool.claudeModel = clean(pool.claudeModel) || CLAUDE_MODELS[0];
+    if (!pool.version) pool.version = 1;
+    return pool;
+  }
+  function save(pool) {
+    var cur = {};
+    try { cur = JSON.parse(localStorage.getItem(POOL_KEY) || '{}') || {}; } catch (e) { cur = {}; }
+    var next = Object.assign({}, cur, pool);
+    next.version = next.version || 1;
+    next.updatedAt = new Date().toISOString();
+    next.providers = (next.providers || []).map(function (p) {
+      var o = Object.assign({}, p);
+      delete o.__ui;
+      return o;
+    });
+    try { localStorage.setItem(POOL_KEY, JSON.stringify(next)); } catch (e) { /* 용량 초과 등 */ }
+    return next;
+  }
+  function ordered(pool) {
+    return pool.providers
+      .map(function (p, i) { return { p: p, i: i }; })
+      .filter(function (x) { return x.p.enabled && clean(x.p.apiKey); })
+      .sort(function (a, b) {
+        var pa = Number(a.p.priority) || (a.i + 1), pb = Number(b.p.priority) || (b.i + 1);
+        return pa === pb ? a.i - b.i : pa - pb;
+      })
+      .map(function (x) { return x.p; });
+  }
+  function labelOf(p) { return clean(p.label) || (TYPES[p.type] ? TYPES[p.type].short : '무료 AI'); }
+  function usableCount() { return ordered(load()).length; }
+  function poolSummary() {
+    var pool = load();
+    var all = pool.providers.length;
+    var use = ordered(pool).length;
+    return { all: all, usable: use, claude: !!(clean(pool.claudeKey) && pool.claudeFallbackEnabled) };
+  }
+  function statusKr(code) {
+    return ({ quota: '한도 초과', auth: '키 거부', model: '모델명 오류', net: '연결 실패', server: '서버 오류', empty: '빈 응답', blocked: '요청 거절', parse: '응답 해석 실패', cooldown: '대기 중', nokey: '키 없음' })[code] || '오류';
+  }
+
+  async function requestOne(p, o, timeoutMs) {
+    var type = p.type;
+    var url, headers, body;
+    var maxTokens = o.maxTokens || 1200;
+    var temp = o.temperature == null ? 0.7 : o.temperature;
+    var sys = o.system || '';
+    var user = o.user || '';
+    if (type === 'gemini') {
+      url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(p.model || TYPES.gemini.model) + ':generateContent';
+      headers = { 'Content-Type': 'application/json', 'x-goog-api-key': p.apiKey };
+      body = {
+        systemInstruction: { parts: [{ text: sys }] },
+        contents: [{ role: 'user', parts: [{ text: user }] }],
+        generationConfig: { temperature: temp, maxOutputTokens: maxTokens }
+      };
+    } else if (type === 'groq') {
+      url = 'https://api.groq.com/openai/v1/chat/completions';
+      headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + p.apiKey };
+      body = {
+        model: p.model || TYPES.groq.model, temperature: temp, max_tokens: maxTokens,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }]
+      };
+    } else {
+      url = 'https://openrouter.ai/api/v1/chat/completions';
+      headers = {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + p.apiKey,
+        'HTTP-Referer': (location.origin || 'https://gdhan77-cell.github.io') + '/', 'X-Title': '한경동 AI'
+      };
+      body = {
+        model: p.model || TYPES.openrouter.model, temperature: temp, max_tokens: maxTokens,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }]
+      };
+    }
+
+    var ac = new AbortController();
+    var timedOut = false;
+    var timer = setTimeout(function () { timedOut = true; try { ac.abort(); } catch (e) {} }, timeoutMs || 90000);
+    var res, text;
+    try {
+      res = await fetch(url, { method: 'POST', headers: headers, body: JSON.stringify(body), signal: ac.signal });
+      text = await res.text();
+    } catch (e) {
+      throw err(timedOut ? 'net' : 'net', labelOf(p) + (timedOut ? ' 응답이 너무 늦습니다' : '에 연결하지 못했습니다'));
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      var detail = text;
+      try { var jj = JSON.parse(text); detail = (jj.error && (jj.error.message || jj.error.status)) || (jj.message) || text; } catch (e) { /* */ }
+      detail = String(detail || '').slice(0, 160);
+      var code = res.status === 429 ? 'quota'
+        : (res.status === 401 || res.status === 403) ? 'auth'
+        : res.status === 404 ? 'model'
+        : res.status >= 500 ? 'server' : 'http';
+      var msg = labelOf(p) + ' ' + statusKr(code) + ' (HTTP ' + res.status + ')' + (detail ? ' · ' + detail : '');
+      throw err(code, msg, { status: res.status, retryAfter: res.headers.get('retry-after') });
+    }
+    var j = null;
+    try { j = JSON.parse(text); } catch (e) { throw err('parse', labelOf(p) + ' 응답을 읽지 못했습니다'); }
+    var out = '';
+    if (type === 'gemini') {
+      var c = j && j.candidates && j.candidates[0];
+      var parts = (c && c.content && c.content.parts) || [];
+      out = parts.map(function (x) { return (x && x.text) || ''; }).join('').trim();
+      if (!out && j && j.promptFeedback && j.promptFeedback.blockReason) {
+        throw err('blocked', labelOf(p) + '가 이 요청을 거절했습니다(' + j.promptFeedback.blockReason + ')');
+      }
+    } else {
+      out = (((j && j.choices && j.choices[0] && j.choices[0].message) || {}).content || '').trim();
+    }
+    if (!out) throw err('empty', labelOf(p) + '가 빈 응답을 보냈습니다');
+    return out;
+  }
+
+  function markOk(pool, p) {
+    for (var i = 0; i < pool.providers.length; i++) {
+      if (pool.providers[i].id === p.id) {
+        pool.providers[i].cooldownUntil = 0;
+        pool.providers[i].lastError = '';
+        pool.providers[i].lastOkAt = new Date().toISOString();
+      }
+    }
+    save(pool);
+  }
+  function markErr(pool, p, e) {
+    var wait = e.code === 'quota' ? 60000 : e.code === 'auth' ? 600000 : e.code === 'net' ? 30000 : 20000;
+    var ra = Number(e.retryAfter);
+    if (e.code === 'quota' && isFinite(ra) && ra > 0) wait = Math.min(ra * 1000, 300000);
+    for (var i = 0; i < pool.providers.length; i++) {
+      if (pool.providers[i].id === p.id) {
+        pool.providers[i].cooldownUntil = now() + wait;
+        pool.providers[i].lastError = statusKr(e.code) + (e.status ? ' (HTTP ' + e.status + ')' : '');
+        pool.providers[i].lastErrorAt = new Date().toISOString();
+      }
+    }
+    save(pool);
+  }
+
+  async function requestClaude(pool, o, model, timeoutMs) {
+    var ac = new AbortController();
+    var timer = setTimeout(function () { try { ac.abort(); } catch (e) {} }, timeoutMs || 120000);
+    var res, text;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': pool.claudeKey,
+          'anthropic-version': '2026-10-21',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        /* Sonnet 5.5는 temperature 등 샘플링 파라미터를 받으면 400이므로 넣지 않는다. */
+        body: JSON.stringify({
+          model: model,
+          max_tokens: o.maxTokens || 2000,
+          system: o.system || '',
+          messages: [{ role: 'user', content: o.user }]
+        }),
+        signal: ac.signal
+      });
+      text = await res.text();
+    } catch (e) {
+      throw err('net', '클로드에 연결하지 못했습니다');
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      var detail = text;
+      try { var jj = JSON.parse(text); detail = (jj.error && (jj.error.message || jj.error.type)) || text; } catch (e) { /* */ }
+      detail = String(detail || '').slice(0, 160);
+      var code = res.status === 404 ? 'model'
+        : res.status === 429 ? 'quota'
+        : (res.status === 401 || res.status === 403) ? 'auth'
+        : res.status >= 500 ? 'server' : 'http';
+      throw err(code, '클로드 ' + statusKr(code) + ' (HTTP ' + res.status + ')' + (detail ? ' · ' + detail : ''), { status: res.status });
+    }
+    var j = null;
+    try { j = JSON.parse(text); } catch (e) { throw err('parse', '클로드 응답을 읽지 못했습니다'); }
+    var out = ((j && j.content) || []).filter(function (b) { return b && b.type === 'text'; }).map(function (b) { return b.text; }).join('\n').trim();
+    if (!out) throw err('empty', '클로드가 빈 응답을 보냈습니다');
+    return out;
+  }
+
+  async function callClaude(o) {
+    var pool = load();
+    if (!clean(pool.claudeKey)) throw err('nokey', '클로드 키가 없습니다');
+    var first = clean(pool.claudeModel) || CLAUDE_MODELS[0];
+    var models = [first].concat(CLAUDE_MODELS.filter(function (m) { return m !== first; }));
+    var last = null;
+    for (var i = 0; i < models.length; i++) {
+      try {
+        var text = await requestClaude(pool, o, models[i], o.timeoutMs);
+        return { text: text, provider: 'claude', label: '클로드', type: 'claude', model: models[i], claudeFallback: true };
+      } catch (e) {
+        last = e;
+        if (e.code !== 'model') throw e;
+      }
+    }
+    throw last || err('fail', '클로드 응답을 받지 못했습니다');
+  }
+
+  /* 무료 키들을 순서대로 시도 → 모두 실패하면 (설정 시) 클로드로 보완 */
+  async function call(o) {
+    o = o || {};
+    var pool = load();
+    var list = ordered(pool);
+    var tried = [];
+    var t = now();
+    var ready = list.filter(function (p) { return !(p.cooldownUntil && p.cooldownUntil > t); });
+    var cooling = list.filter(function (p) { return p.cooldownUntil && p.cooldownUntil > t; });
+
+    for (var i = 0; i < ready.length; i++) {
+      var p = ready[i];
+      try {
+        var text = await requestOne(p, o, o.timeoutMs);
+        markOk(pool, p);
+        return { text: text, provider: p.id, label: labelOf(p), type: p.type, tried: tried };
+      } catch (e) {
+        markErr(pool, p, e);
+        tried.push({ label: labelOf(p), status: e.code });
+      }
+    }
+
+    /* 모든 무료 키가 한도 대기 중이면 클로드 보완을 먼저 시도, 없으면 가장 빨리 풀리는 키 하나를 시험 */
+    if (!ready.length && cooling.length) {
+      cooling.sort(function (a, b) { return a.cooldownUntil - b.cooldownUntil; });
+      if (!(o.allowClaude !== false && pool.claudeFallbackEnabled && clean(pool.claudeKey))) {
+        var c = cooling[0];
+        try {
+          var t2 = await requestOne(c, o, o.timeoutMs);
+          markOk(pool, c);
+          return { text: t2, provider: c.id, label: labelOf(c), type: c.type, tried: tried };
+        } catch (e2) {
+          markErr(pool, c, e2);
+          tried.push({ label: labelOf(c), status: e2.code });
+        }
+      }
+      cooling.forEach(function (x) { tried.push({ label: labelOf(x), status: 'cooldown' }); });
+    }
+
+    if (o.allowClaude !== false && pool.claudeFallbackEnabled && clean(pool.claudeKey)) {
+      var r = await callClaude(o);
+      r.tried = tried;
+      return r;
+    }
+
+    if (!list.length) {
+      throw err('nofree', '무료 AI 키가 없습니다. 설정에서 Gemini·Groq·OpenRouter 키를 넣어 주세요.');
+    }
+    var detail = tried.filter(function (x) { return x.status !== 'cooldown'; })
+      .map(function (x) { return x.label + '(' + statusKr(x.status) + ')'; }).join(', ');
+    throw err('allfail', '무료 AI가 모두 응답하지 못했습니다.' + (detail ? ' — ' + detail : ''));
+  }
+
+  async function testProvider(p) {
+    var pp = normProvider(Object.assign({}, p, { enabled: true }), 0);
+    if (!clean(pp.apiKey)) return { ok: false, message: '키를 입력하세요' };
+    var t0 = now();
+    try {
+      var out = await requestOne(pp, {
+        system: '너는 연결 확인용 도우미다. 아주 짧게 답한다.',
+        user: '"연결됨"이라고만 답하세요.',
+        maxTokens: 24, temperature: 0, timeoutMs: 30000
+      });
+      return { ok: true, message: '정상 ✓ ' + String(out).slice(0, 16), ms: now() - t0 };
+    } catch (e) {
+      return { ok: false, message: String(e.message || e.code || '오류').slice(0, 120), ms: now() - t0 };
+    }
+  }
+
+  async function testClaude(key, model) {
+    var pool = load();
+    pool.claudeKey = clean(key);
+    pool.claudeModel = clean(model) || CLAUDE_MODELS[0];
+    if (!pool.claudeKey) return { ok: false, message: '클로드 키를 입력하세요' };
+    try {
+      var r = await callClaude({ system: '짧게 답한다.', user: '"연결됨"이라고만 답하세요.', maxTokens: 24, timeoutMs: 30000 });
+      return { ok: true, message: '정상 ✓ ' + r.model, model: r.model };
+    } catch (e) {
+      return { ok: false, message: String(e.message || e.code) };
+    }
+  }
+
+  /* ---------------- 설정 화면 UI ---------------- */
+  var CSS_ID = 'hfa-style';
+  function injectCss() {
+    if (document.getElementById(CSS_ID)) return;
+    var st = document.createElement('style');
+    st.id = CSS_ID;
+    st.textContent = [
+      '.hfa{border:1px solid rgba(120,100,70,.28);border-radius:12px;padding:.7rem .75rem;background:rgba(255,252,245,.6);max-width:100%;min-width:0;overflow:hidden}',
+      '.hfa *{box-sizing:border-box}',
+      '.hfa-head{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap;margin-bottom:.3rem}',
+      '.hfa-head b{font-size:.86rem}',
+      '.hfa-count{font-size:.7rem;opacity:.72}',
+      '.hfa-note{font-size:.7rem;line-height:1.5;opacity:.78;margin:.1rem 0 .55rem}',
+      '.hfa-note code{font-size:.68rem;padding:0 .2rem;border-radius:4px;background:rgba(120,100,70,.12)}',
+      '.hfa-rows{display:flex;flex-direction:column;gap:.4rem;min-width:0}',
+      '.hfa-row{display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;padding:.4rem;border:1px solid rgba(120,100,70,.2);border-radius:9px;background:rgba(255,255,255,.5);min-width:0;max-width:100%}',
+      '.hfa-row input{min-width:0;max-width:100%}',
+      '.hfa-row input[data-f=\"label\"]{flex:1 1 4.6rem;width:auto}',
+      '.hfa-row.off{opacity:.55}',
+      '.hfa-row input[type=text],.hfa-row input[type=password]{width:100%;min-width:0;font-size:.72rem;padding:.28rem .35rem;border:1px solid rgba(120,100,70,.35);border-radius:6px;background:#fff;color:inherit}',
+      '.hfa-type{font-size:.66rem;font-weight:700;padding:.18rem .34rem;border-radius:5px;background:rgba(120,100,70,.14);white-space:nowrap;flex:0 0 auto}',
+      '.hfa-en{display:flex;align-items:center;gap:.2rem;font-size:.66rem;white-space:nowrap}',
+      '.hfa-keyw{display:flex;gap:.2rem;min-width:0;flex:2 1 7rem}',
+      '.hfa-row input[data-f=\"model\"]{flex:1 1 6rem;width:auto}',
+      '.hfa-acts{display:flex;gap:.15rem;flex-wrap:nowrap;margin-left:auto}',
+      '.hfa-acts button{font-size:.66rem;padding:.24rem .34rem;border:1px solid rgba(120,100,70,.35);border-radius:6px;background:rgba(255,255,255,.85);color:inherit;cursor:pointer;line-height:1.2;white-space:nowrap}',
+      '.hfa-acts button:hover{background:rgba(120,100,70,.12)}',
+      '.hfa-msg{flex:1 0 100%;font-size:.68rem;line-height:1.4}',
+      '.hfa-msg.ok{color:#1d7a4a}.hfa-msg.err{color:#b3382c}',
+      '.hfa-add{display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.5rem}',
+      '.hfa-add button{font-size:.7rem;padding:.3rem .5rem;border:1px dashed rgba(120,100,70,.45);border-radius:7px;background:transparent;color:inherit;cursor:pointer}',
+      '.hfa-claude{margin-top:.6rem;padding-top:.55rem;border-top:1px dashed rgba(120,100,70,.3)}',
+      '.hfa-claude label{display:flex;gap:.35rem;align-items:flex-start;font-size:.72rem;line-height:1.45}',
+      '.hfa-crow{display:grid;grid-template-columns:minmax(7rem,1.6fr) minmax(6rem,1fr) auto;gap:.3rem;margin-top:.35rem}',
+      '.hfa-crow input{width:100%;min-width:0;font-size:.72rem;padding:.28rem .35rem;border:1px solid rgba(120,100,70,.35);border-radius:6px;background:#fff;color:inherit}',
+      '.hfa-crow button{font-size:.68rem;padding:.26rem .45rem;border:1px solid rgba(120,100,70,.35);border-radius:6px;background:rgba(255,255,255,.85);color:inherit;cursor:pointer}',
+      '.hfa-empty{font-size:.7rem;opacity:.7;padding:.35rem .1rem}',
+      '@media(max-width:620px){.hfa-keyw,.hfa-row input[data-f=\"model\"]{flex:1 0 100%}.hfa-acts{flex:1 0 100%;justify-content:flex-end;margin-left:0}.hfa-crow{grid-template-columns:1fr}.hfa-crow button{justify-self:start}}'
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
+
+  function mount(el, opts) {
+    if (!el) return null;
+    opts = opts || {};
+    injectCss();
+    var ui = { el: el, shown: {} };
+
+    function persist(pool) { save(pool); if (typeof opts.onChange === 'function') opts.onChange(pool); }
+
+    function render() {
+      var pool = load();
+      var use = ordered(pool);
+      var html = '';
+      html += '<div class="hfa-head"><b>무료 AI 키 풀</b><span class="hfa-count">사용 가능 ' + use.length + '개 · 등록 ' + pool.providers.length + '개</span></div>';
+      html += '<p class="hfa-note">Gemini·Groq·OpenRouter 무료 키를 여러 개 넣어 두면, 한도(429)나 오류가 난 키는 건너뛰고 <b>다음 키로 자동 전환</b>합니다. 이 키 묶음은 이 브라우저의 <code>han_free_ai_pool_v1</code>에 저장되어 <b>free-ai-hub</b>와 같은 주소의 다른 앱이 함께 씁니다.' +
+        (use.length ? '' : ' <b>아직 쓸 수 있는 무료 키가 없습니다.</b>') + '</p>';
+
+      html += '<div class="hfa-rows">';
+      if (!pool.providers.length) {
+        html += '<div class="hfa-empty">아래 [+ Gemini] 같은 버튼으로 무료 키를 추가하세요. 키 발급: ' +
+          '<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Gemini</a> · ' +
+          '<a href="https://console.groq.com/keys" target="_blank" rel="noopener">Groq</a> · ' +
+          '<a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter</a></div>';
+      }
+      pool.providers.forEach(function (p, i) {
+        var T = TYPES[p.type];
+        var stateMsg = '';
+        if (p.cooldownUntil && p.cooldownUntil > now()) {
+          stateMsg = '<div class="hfa-msg err">한도·오류로 ' + Math.ceil((p.cooldownUntil - now()) / 1000) + '초 뒤 다시 시도합니다 · ' + esc(p.lastError || '') + '</div>';
+        } else if (p.lastError) {
+          stateMsg = '<div class="hfa-msg err">최근 오류: ' + esc(p.lastError) + '</div>';
+        }
+        html += '<div class="hfa-row' + (p.enabled ? '' : ' off') + '" data-id="' + esc(p.id) + '">' +
+          '<label class="hfa-en"><input type="checkbox" data-f="enabled"' + (p.enabled ? ' checked' : '') + '> 사용</label>' +
+          '<span class="hfa-type">' + esc(T.short) + '</span>' +
+          '<input type="text" data-f="label" value="' + esc(p.label) + '" aria-label="키 이름">' +
+          '<div class="hfa-keyw"><input type="password" data-f="apiKey" value="' + esc(p.apiKey) + '" placeholder="' + esc(T.ph) + '" autocomplete="off" spellcheck="false" aria-label="API 키"><button type="button" data-a="eye" title="보기">👁</button></div>' +
+          '<input class="hfa-modelin" type="text" data-f="model" value="' + esc(p.model) + '" aria-label="모델명">' +
+          '<div class="hfa-acts">' +
+            '<button type="button" data-a="test">테스트</button>' +
+            '<button type="button" data-a="up" title="위로"' + (i === 0 ? ' disabled' : '') + '>↑</button>' +
+            '<button type="button" data-a="down" title="아래로"' + (i === pool.providers.length - 1 ? ' disabled' : '') + '>↓</button>' +
+            '<button type="button" data-a="del" title="삭제">✕</button>' +
+          '</div>' +
+          '<div class="hfa-msg" data-msg></div>' +
+          (stateMsg ? stateMsg : '') +
+        '</div>';
+      });
+      html += '</div>';
+
+      html += '<div class="hfa-add">' +
+        '<button type="button" data-add="gemini">+ Gemini</button>' +
+        '<button type="button" data-add="groq">+ Groq</button>' +
+        '<button type="button" data-add="openrouter">+ OpenRouter</button>' +
+        '</div>';
+
+      html += '<div class="hfa-claude">' +
+        '<label><input type="checkbox" data-c="fallback"' + (pool.claudeFallbackEnabled ? ' checked' : '') + '>' +
+        '<span>무료 AI가 모두 한도 초과일 때만 내 클로드 키로 자동 보완 <span style="opacity:.7">(체크를 풀면 100% 무료 AI만 순환)</span></span></label>' +
+        '<div class="hfa-crow">' +
+          '<input type="password" data-c="key" value="' + esc(pool.claudeKey) + '" placeholder="클로드 키 sk-ant-… (선택)" autocomplete="off" spellcheck="false" aria-label="클로드 API 키">' +
+          '<input type="text" data-c="model" value="' + esc(pool.claudeModel) + '" spellcheck="false" aria-label="클로드 모델">' +
+          '<button type="button" data-c="test">클로드 확인</button>' +
+        '</div>' +
+        '<div class="hfa-msg" data-cmsg></div>' +
+      '</div>';
+      el.innerHTML = html;
+    }
+
+    function poolMutate(fn) {
+      var pool = load();
+      fn(pool);
+      persist(pool);
+      render();
+    }
+
+    el.addEventListener('click', async function (ev) {
+      var btn = ev.target.closest('button');
+      if (!btn || !el.contains(btn)) return;
+      var row = btn.closest('.hfa-row');
+      var add = btn.getAttribute('data-add');
+      if (add) {
+        var type = add;
+        poolMutate(function (pool) {
+          var n = pool.providers.filter(function (x) { return x.type === type; }).length + 1;
+          pool.providers.push({
+            id: uid(), type: type, label: TYPES[type].short + ' ' + n, apiKey: '',
+            model: TYPES[type].model, enabled: true, priority: pool.providers.length + 1
+          });
+        });
+        return;
+      }
+      var c = btn.getAttribute('data-c');
+      if (c === 'test') {
+        var keyEl = el.querySelector('[data-c="key"]');
+        var modelEl = el.querySelector('[data-c="model"]');
+        var msg = el.querySelector('[data-cmsg]');
+        btn.disabled = true; var old = btn.textContent; btn.textContent = '확인 중…';
+        var r = await testClaude(keyEl.value, modelEl.value);
+        btn.disabled = false; btn.textContent = old;
+        if (msg) { msg.className = 'hfa-msg ' + (r.ok ? 'ok' : 'err'); msg.textContent = r.message; }
+        if (r.ok) {
+          poolMutate(function (pool) { pool.claudeKey = clean(keyEl.value); pool.claudeModel = r.model || clean(modelEl.value); });
+        }
+        return;
+      }
+      if (!row) return;
+      var id = row.getAttribute('data-id');
+      var a = btn.getAttribute('data-a');
+      if (a === 'eye') {
+        var inp = row.querySelector('[data-f="apiKey"]');
+        inp.type = inp.type === 'password' ? 'text' : 'password';
+        return;
+      }
+      if (a === 'del') {
+        poolMutate(function (pool) { pool.providers = pool.providers.filter(function (x) { return x.id !== id; }); });
+        return;
+      }
+      if (a === 'up' || a === 'down') {
+        poolMutate(function (pool) {
+          var i = pool.providers.findIndex(function (x) { return x.id === id; });
+          var j = a === 'up' ? i - 1 : i + 1;
+          if (i < 0 || j < 0 || j >= pool.providers.length) return;
+          var tmp = pool.providers[i]; pool.providers[i] = pool.providers[j]; pool.providers[j] = tmp;
+          pool.providers.forEach(function (x, k) { x.priority = k + 1; });
+        });
+        return;
+      }
+      if (a === 'test') {
+        var p = load().providers.find(function (x) { return x.id === id; });
+        if (!p) return;
+        p.apiKey = clean(row.querySelector('[data-f="apiKey"]').value);
+        p.model = clean(row.querySelector('[data-f="model"]').value) || TYPES[p.type].model;
+        var m = row.querySelector('[data-msg]');
+        btn.disabled = true; btn.textContent = '확인 중…';
+        var res = await testProvider(p);
+        btn.disabled = false; btn.textContent = '테스트';
+        if (m) { m.className = 'hfa-msg ' + (res.ok ? 'ok' : 'err'); m.textContent = res.message; }
+        if (res.ok) poolMutate(function (pool) {
+          var t = pool.providers.find(function (x) { return x.id === id; });
+          if (t) { t.lastError = ''; t.cooldownUntil = 0; t.lastOkAt = new Date().toISOString(); }
+        });
+        return;
+      }
+    });
+
+    el.addEventListener('input', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var row = t.closest('.hfa-row');
+      var f = t.getAttribute('data-f');
+      var c = t.getAttribute('data-c');
+      clearTimeout(ui.timer);
+      ui.timer = setTimeout(function () {
+        var pool = load();
+        if (row && f) {
+          var id = row.getAttribute('data-id');
+          var p = pool.providers.find(function (x) { return x.id === id; });
+          if (!p) return;
+          if (f === 'apiKey') p.apiKey = clean(t.value);
+          else if (f === 'label') p.label = clean(t.value);
+          else if (f === 'model') p.model = clean(t.value);
+        } else if (c === 'key') pool.claudeKey = clean(t.value);
+        else if (c === 'model') pool.claudeModel = clean(t.value) || CLAUDE_MODELS[0];
+        persist(pool);
+      }, 450);
+    });
+    el.addEventListener('change', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var row = t.closest('.hfa-row');
+      var f = t.getAttribute('data-f');
+      var c = t.getAttribute('data-c');
+      if (row && f === 'enabled') {
+        var id = row.getAttribute('data-id');
+        poolMutate(function (pool) {
+          var p = pool.providers.find(function (x) { return x.id === id; });
+          if (p) p.enabled = !!t.checked;
+        });
+      } else if (c === 'fallback') {
+        poolMutate(function (pool) { pool.claudeFallbackEnabled = !!t.checked; });
+      }
+    });
+
+    render();
+    ui.refresh = render;
+    window.addEventListener('storage', function (e) { if (e.key === POOL_KEY) render(); });
+    return ui;
+  }
+
+  window.HanFreeAI = {
+    KEY: POOL_KEY,
+    TYPES: TYPES,
+    CLAUDE_MODELS: CLAUDE_MODELS,
+    load: load,
+    save: save,
+    blank: blank,
+    call: call,
+    callClaude: callClaude,
+    testProvider: testProvider,
+    testClaude: testClaude,
+    usableCount: usableCount,
+    poolSummary: poolSummary,
+    mount: mount,
+    statusKr: statusKr
+  };
+})();
+
+</script>
+<!-- FREEAI-CORE:END -->
 <script>
 /* =========================================================
    보내굿노트 — 단일 HTML 메모 앱
@@ -911,6 +1527,7 @@ const DEFAULT_FOLDERS = [
 let state = null;
 let saveTimer = null;
 let pendingImage = null;
+let poolUI = null;
 
 function uid(p){ return (p||'m') + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 
@@ -920,7 +1537,7 @@ function freshState(seed){
     folders: DEFAULT_FOLDERS.map(f => Object.assign({}, f, { custom:false })),
     memos: [],
     notes: {},
-    settings: { engine:'local', apiKey:'', model:'claude-sonnet-4-5' }
+    settings: { engine:'local', apiKey:'', model:'claude-sonnet-5-5' }
   };
   if (seed) s.memos = sampleMemos();
   return s;
@@ -940,7 +1557,8 @@ function loadState(){
     if (!Array.isArray(state.folders) || !state.folders.length) state.folders = DEFAULT_FOLDERS.map(f=>Object.assign({},f,{custom:false}));
     if (!Array.isArray(state.memos)) state.memos = [];
     if (!state.notes || typeof state.notes !== 'object') state.notes = {};
-    state.settings = Object.assign({ engine:'local', apiKey:'', model:'claude-sonnet-4-5' }, state.settings||{});
+    state.settings = Object.assign({ engine:'local', apiKey:'', model:'claude-sonnet-5-5' }, state.settings||{});
+    if (state.settings.model === 'claude-sonnet-4-5') state.settings.model = 'claude-sonnet-5-5';
   } catch(e){
     state = freshState(true);
     saveState(true);
@@ -1268,43 +1886,71 @@ function icsAll(){
   toast(items.length + '개 일정을 .ics로 내보냈어요');
 }
 
-/* ---------- Claude API (선택) ---------- */
+/* ---------- AI 분류 (무료 AI 자동 전환 / Claude 선택) ---------- */
+function freeAiReady(){
+  try { return !!(window.HanFreeAI && (HanFreeAI.poolSummary().usable > 0 || HanFreeAI.poolSummary().claude)); }
+  catch(e){ return false; }
+}
+function claudeModelList(){
+  const first = (state.settings.model || '').trim();
+  const list = [];
+  [first].concat(['claude-sonnet-5-5','claude-sonnet-4-6','claude-sonnet-4-5']).forEach(m => { if (m && list.indexOf(m) < 0) list.push(m); });
+  return list;
+}
+async function claudeClassify(system, user, s){
+  let lastErr = null;
+  for (const model of claudeModelList()){
+    let res;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': s.apiKey,
+          'anthropic-version': '2026-10-21',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        /* Sonnet 5.5는 temperature 등 샘플링 파라미터에 400을 돌려주므로 넣지 않는다 */
+        body: JSON.stringify({ model: model, max_tokens: 400, system: system, messages: [{ role: 'user', content: user }] })
+      });
+    } catch(e){
+      throw new Error('클로드에 연결하지 못했어요');
+    }
+    if (res.status === 404){ lastErr = new Error('모델명을 찾지 못했어요 (' + model + ')'); continue; }
+    if (!res.ok){
+      let detail = '';
+      try { const j = await res.json(); detail = (j.error && j.error.message) || ''; } catch(e){}
+      throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail : ''));
+    }
+    const data = await res.json();
+    const raw = (data.content || []).map(c => c.text || '').join('');
+    return { raw: raw, via: 'Claude API' };
+  }
+  throw (lastErr || new Error('클로드 응답을 받지 못했어요'));
+}
 async function aiClassify(text){
   const s = state.settings;
-  if (s.engine !== 'claude' || !s.apiKey) return null;
+  if (s.engine === 'local') return null;
+  if (s.engine === 'claude' && !s.apiKey) return null;
+  if (s.engine === 'free' && !freeAiReady()) return null;
   const folderList = state.folders.map(f => f.id + ':' + f.name).join(', ');
   const now = new Date();
-  const body = {
-    model: s.model || 'claude-sonnet-4-5',
-    max_tokens: 400,
-    system: '너는 한국어 메모 정리 도우미다. 반드시 JSON 객체 하나만 출력하고 설명·코드불록은 쓰지 않는다.',
-    messages: [{
-      role: 'user',
-      content:
-        '오늘은 ' + now.getFullYear() + '년 ' + (now.getMonth()+1) + '월 ' + now.getDate() + '일 ' + WEEK_KR[now.getDay()] + '요일, 현재 시각 ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()) + '이다.\n' +
-        '아래 메모를 폴더 하나에 넣고, 제목과 일정을 정리해줘.\n' +
-        '폴더 목록(id:이름) — ' + folderList + '\n' +
-        '규칙: 날짜나 시간이 없으면 due를 null로. 있으면 due에 YYYY-MM-DDTHH:MM(24시간제, 로컬)으로. 날짜만 있으면 09:00, 시간만 있으면 가장 가까운 미래 시각.\n' +
-        '출력 형식: {"folder":"폴더id","title":"짧은 제목","due":"2026-11-24T15:00"} 또는 due:null\n\n메모: ' + text
-    }]
-  };
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': s.apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok){
-    let detail = '';
-    try { const j = await res.json(); detail = (j.error && j.error.message) || ''; } catch(e){}
-    throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail : ''));
+  const system = '너는 한국어 메모 정리 도우미다. 반드시 JSON 객체 하나만 출력하고 설명·코드불록은 쓰지 않는다.';
+  const user =
+    '오늘은 ' + now.getFullYear() + '년 ' + (now.getMonth()+1) + '월 ' + now.getDate() + '일 ' + WEEK_KR[now.getDay()] + '요일, 현재 시각 ' + pad2(now.getHours()) + ':' + pad2(now.getMinutes()) + '이다.\n' +
+    '아래 메모를 폴더 하나에 넣고, 제목과 일정을 정리해줘.\n' +
+    '폴더 목록(id:이름) — ' + folderList + '\n' +
+    '규칙: 날짜나 시간이 없으면 due를 null로. 있으면 due에 YYYY-MM-DDTHH:MM(24시간제, 로컬)으로. 날짜만 있으면 09:00, 시간만 있으면 가장 가까운 미래 시각.\n' +
+    '출력 형식: {"folder":"폴더id","title":"짧은 제목","due":"2026-11-24T15:00"} 또는 due:null\n\n메모: ' + text;
+
+  let raw = '', via = '';
+  if (s.engine === 'free'){
+    const r = await HanFreeAI.call({ system: system, user: user, maxTokens: 400, temperature: 0.2, timeoutMs: 60000 });
+    raw = r.text; via = r.label || '무료 AI';
+  } else {
+    const r = await claudeClassify(system, user, s);
+    raw = r.raw; via = r.via;
   }
-  const data = await res.json();
-  const raw = (data.content || []).map(c => c.text || '').join('');
   const mt = raw.match(/\{[\s\S]*\}/);
   if (!mt) throw new Error('응답에 JSON이 없어요');
   const j = JSON.parse(mt[0]);
@@ -1318,7 +1964,7 @@ async function aiClassify(text){
     const d = new Date(j.due);
     if (!isNaN(d.getTime())) due = d.getTime();
   }
-  return { folderId, title: j.title || null, due };
+  return { folderId, title: j.title || null, due, via };
 }
 
 /* ---------- 메모 등록 ---------- */
@@ -1346,8 +1992,8 @@ async function sendMemo(rawText, opts){
   scrollChat(true);
   saveState();
 
-  // Claude가 켜져 있으면 결과로 조용히 보정
-  if (state.settings.engine === 'claude' && state.settings.apiKey && !o.folderId){
+  // AI(무료 자동 전환·Claude)가 켜져 있으면 결과로 조용히 보정
+  if ((state.settings.engine === 'free' || (state.settings.engine === 'claude' && state.settings.apiKey)) && !o.folderId){
     try {
       const ai = await aiClassify(text);
       if (ai){
@@ -1355,11 +2001,13 @@ async function sendMemo(rawText, opts){
         if (ai.due) { memo.dueAt = ai.due; memo.assumedTime = false; }
         memo.classifiedBy = 'ai';
         memo.aiTitle = ai.title || null;
+        memo.aiVia = ai.via || null;
+        memo.aiEngine = state.settings.engine;
         renderAll();
         saveState();
       }
     } catch(e){
-      toast('Claude 연결 실패 — 내장 분류기로 정리했어요');
+      toast('AI 연결 실패 — 내장 분류기로 정리했어요');
     }
   }
   return memo;
@@ -1439,9 +2087,11 @@ function renderAll(){
 
 function renderEnginePill(){
   const pill = $('#enginePill');
-  const on = state.settings.engine === 'claude' && !!state.settings.apiKey;
-  pill.classList.toggle('claude', on);
-  $('#engineText').textContent = on ? 'Claude AI' : '내장 AI';
+  const s = state.settings;
+  const free = s.engine === 'free' && freeAiReady();
+  const claude = s.engine === 'claude' && !!s.apiKey;
+  pill.classList.toggle('claude', claude || free);
+  $('#engineText').textContent = claude ? 'Claude AI' : (free ? '무료 AI 자동 전환' : '내장 AI');
 }
 
 /* ---------- 채팅 ---------- */
@@ -1494,7 +2144,7 @@ function memoRowHtml(m){
   const f = folderById(m.folderId);
   const isAi = m.classifiedBy === 'ai';
   const isManual = m.classifiedBy === 'manual';
-  const badge = isAi ? '✨ Claude 정리 · 📁 ' + esc(f.name)
+  const badge = isAi ? (m.aiEngine === 'claude' ? '✨ Claude' : '✨ 무료 AI·' + esc(m.aiVia || '자동')) + ' 정리 · 📁 ' + esc(f.name)
     : (isManual ? '📁 ' + esc(f.name) + ' · 직접 고름'
     : '✨ AI 정리 · 📁 ' + esc(f.name));
   return '<div class="msg-row right" data-memo="' + esc(m.id) + '">' +
@@ -2012,9 +2662,16 @@ function setEngineStatus(kind, msg){
 function updateEngineStatus(){
   const s = state.settings;
   if (s.engine === 'claude' && s.apiKey){
-    setEngineStatus('ok', '✅ Claude 연결됨 · ' + (s.model || 'claude-sonnet-4-5') + ' — 문맥 기반으로 폴더·제목·일정을 정리합니다');
+    setEngineStatus('ok', '✅ Claude 연결됨 · ' + (s.model || 'claude-sonnet-5-5') + ' — 문맥 기반으로 폴더·제목·일정을 정리합니다');
   } else if (s.engine === 'claude'){
     setEngineStatus('err', '⚠️ Claude를 골랐지만 키가 없어요 · 내장 스마트 분류기로 동작 중');
+  } else if (s.engine === 'free'){
+    if (freeAiReady()){
+      const f = HanFreeAI.poolSummary();
+      setEngineStatus('ok', '✅ 무료 AI 자동 전환 · 사용 가능 키 ' + f.usable + '개' + (f.claude ? ' · 모두 막히면 클로드로 보완' : '') + ' — 문맥 기반으로 폴더·제목·일정을 정리합니다');
+    } else {
+      setEngineStatus('err', '⚠️ 무료 AI를 골랐지만 쓸 수 있는 무료 키가 없어요 · 내장 스마트 분류기로 동작 중');
+    }
   } else {
     setEngineStatus('', '🔑 키 없음 · 내장 스마트 분류기로 동작 중 (바로 쓸 수 있어요)');
   }
@@ -2029,9 +2686,11 @@ function updateDataInfo(){
 function openSettings(){
   const s = state.settings;
   $('#apiKeyInput').value = s.apiKey || '';
-  $('#modelInput').value = s.model || 'claude-sonnet-4-5';
+  $('#modelInput').value = s.model || 'claude-sonnet-5-5';
   $$('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.engine === s.engine));
   $('#claudeBox').hidden = s.engine !== 'claude';
+  $('#freeBox').hidden = s.engine !== 'free';
+  if (poolUI && poolUI.refresh) poolUI.refresh();
   updateEngineStatus();
   updateDataInfo();
   openModal('settingsModal');
@@ -2039,7 +2698,7 @@ function openSettings(){
 
 async function testKey(){
   const key = $('#apiKeyInput').value.trim();
-  const model = $('#modelInput').value.trim() || 'claude-sonnet-4-5';
+  const model = $('#modelInput').value.trim() || 'claude-sonnet-5-5';
   if (!key){ setEngineStatus('err', '⚠️ API 키를 먼저 입력해 주세요'); return; }
   const btn = $('#testKeyBtn');
   btn.disabled = true; btn.textContent = '확인 중…';
@@ -2335,6 +2994,7 @@ function bindEvents(){
     $('#apiKeyInput').value = '';
     $$('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.engine === 'local'));
     $('#claudeBox').hidden = true;
+    $('#freeBox').hidden = true;
     saveState(true); renderEnginePill(); updateEngineStatus(); updateDataInfo();
     toast('키를 지웠어요 · 내장 분류기로 동작합니다');
   });
@@ -2342,6 +3002,7 @@ function bindEvents(){
     state.settings.engine = b.dataset.engine;
     $$('#engineSeg button').forEach(x => x.classList.toggle('on', x === b));
     $('#claudeBox').hidden = b.dataset.engine !== 'claude';
+    $('#freeBox').hidden = b.dataset.engine !== 'free';
     saveState(true); renderEnginePill(); updateEngineStatus();
   }));
   $('#sampleBtn').addEventListener('click', ()=>{
@@ -2379,6 +3040,7 @@ function init(){
   loadState();
   renderSuggestions();
   bindEvents();
+  try { poolUI = window.HanFreeAI ? HanFreeAI.mount($('#freePool'), { onChange: function(){ renderEnginePill(); updateEngineStatus(); } }) : null; } catch(e){ poolUI = null; }
   renderAll();
   setView('chat');
   updateSendState();
