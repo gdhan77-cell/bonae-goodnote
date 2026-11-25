@@ -3275,7 +3275,7 @@ function init(){
   loadState();
   renderSuggestions();
   bindEvents();
-  try { poolUI = window.HanFreeAI ? HanFreeAI.mount($('#freePool'), { onChange: function(){ renderEnginePill(); updateEngineStatus(); } }) : null; } catch(e){ poolUI = null; }
+  try { poolUI = window.HanFreeAI ? HanFreeAI.mount($('#freePool'), { onChange: function(){ renderEnginePill(); updateEngineStatus(); fillFreeSlots(); } }) : null; } catch(e){ poolUI = null; }
   renderAll();
   setView('chat');
   updateSendState();
